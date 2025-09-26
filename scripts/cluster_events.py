@@ -1,13 +1,17 @@
+import os
 import numpy as np
 from sklearn.cluster import KMeans
 from sqlalchemy import text
 from utils.db import SessionLocal
 
 N_CLUSTERS = 20  # adjust or use elbow method later
+DATA_DIR = os.getenv('DATA_DIR', './data')
 
 def main():
-    ids = np.load('/mnt/data/title_ids.npy')
-    X = np.load('/mnt/data/title_embeds.npy')
+    ids_path = os.path.join(DATA_DIR, 'title_ids.npy')
+    embeds_path = os.path.join(DATA_DIR, 'title_embeds.npy')
+    ids = np.load(ids_path)
+    X = np.load(embeds_path)
     if len(ids) == 0:
         print('Nothing to cluster.')
         return

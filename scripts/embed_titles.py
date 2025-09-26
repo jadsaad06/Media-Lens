@@ -7,6 +7,7 @@ from utils.db import SessionLocal
 
 load_dotenv()
 EMBEDDER = os.getenv('EMBEDDER','sentence-transformers/all-MiniLM-L6-v2')
+DATA_DIR = os.getenv('DATA_DIR', './data')
 
 def fetch_titles(sess, limit=1000):
     rows = sess.execute(text("SELECT id, COALESCE(title,'') AS title FROM articles ORDER BY id DESC LIMIT :lim"), {'lim': limit}).all()
@@ -30,9 +31,12 @@ def main():
         return
     X = model.encode(list(titles), normalize_embeddings=True)
     # Save embeddings temporarily to disk for clustering step
-    np.save('/mnt/data/title_ids.npy', np.array(ids))
-    np.save('/mnt/data/title_embeds.npy', X.astype(np.float32))
-    print(f"Embedded {len(ids)} titles to /mnt/data/title_embeds.npy")
+    os.makedirs(DATA_DIR, exist_ok=True)
+    ids_path = os.path.join(DATA_DIR, 'title_ids.npy')
+    embeds_path = os.path.join(DATA_DIR, 'title_embeds.npy')
+    np.save(ids_path, np.array(ids))
+    np.save(embeds_path, X.astype(np.float32))
+    print(f"Embedded {len(ids)} titles to {embeds_path}")
     sess.close()
 
 if __name__ == '__main__':

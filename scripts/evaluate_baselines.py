@@ -9,6 +9,8 @@ import seaborn as sns
 import matplotlib.pyplot as plt
 from pathlib import Path
 from typing import Dict, List, Tuple
+import hashlib
+import random
 from sklearn.model_selection import train_test_split
 from sklearn.preprocessing import LabelEncoder, MultiLabelBinarizer
 from sklearn.metrics import (
@@ -27,6 +29,10 @@ from sqlalchemy import text as sql_text
 from joblib import dump, load
 from sklearn.calibration import CalibratedClassifierCV
 
+SEED = int(os.getenv('SEED', '42'))
+random.seed(SEED)
+np.random.seed(SEED)
+
 EMBEDDER = os.getenv('EVAL_EMBEDDER', 'sentence-transformers/all-MiniLM-L6-v2')
 DATA_DIR = Path(os.getenv('EVAL_DATA_DIR', './data'))
 OUT_DIR = Path(os.getenv('EVAL_OUT_DIR', './outputs'))
@@ -36,6 +42,7 @@ REPORTS_DIR.mkdir(parents=True, exist_ok=True)
 STANCE_CALIBRATE = os.getenv('STANCE_CALIBRATE', '1') == '1'
 FRAMING_TUNE_THRESHOLDS = os.getenv('FRAMING_TUNE_THRESHOLDS', '1') == '1'
 GLOBAL_FRAMING_THRESHOLD = float(os.getenv('FRAMING_THRESHOLD', '0.3'))
+FRAMING_EMBEDDINGS_ONLY = os.getenv('FRAMING_EMBEDDINGS_ONLY', '0') == '1'
 
 # ----------------------
 # FNC-1 Stance Loading
@@ -76,6 +83,13 @@ def ensure_fnc1_local(data_dir: Path) -> Tuple[Path, Path]:
         if ok1 and ok2:
             return stances_path, bodies_path
     raise RuntimeError('Unable to download FNC-1 training CSVs from known mirrors.')
+
+def _sha256_file(path: Path) -> str:
+    h = hashlib.sha256()
+    with path.open('rb') as f:
+        for chunk in iter(lambda: f.read(8192), b''):
+            h.update(chunk)
+    return h.hexdigest()
 
 STANCE_MAP = {
     'agree': 'pro',
@@ -216,6 +230,21 @@ def run_stance_baseline():
         }
     }
     # Will be augmented with framing later in run_framing_baseline
+    # Append dataset manifest info
+    try:
+        st_path, bo_path = ensure_fnc1_local(DATA_DIR)
+        params['dataset'] = {
+            'fnc1_train_stances.csv': {
+                'path': str(st_path),
+                'sha256': _sha256_file(st_path)
+            },
+            'fnc1_train_bodies.csv': {
+                'path': str(bo_path),
+                'sha256': _sha256_file(bo_path)
+            }
+        }
+    except Exception:
+        pass
     (REPORTS_DIR / 'params.json').write_text(json.dumps(params, indent=2))
 
 # ----------------------
@@ -223,14 +252,27 @@ def run_stance_baseline():
 # ----------------------
 
 KEYWORD_TAGS: Dict[str, List[str]] = {
-    'economy': ['economy','inflation','jobs','market','gdp','unemployment','wage','tax','budget'],
-    'immigration': ['immigration','migrant','asylum','border','visa','refugee'],
-    'health': ['health','hospital','covid','vaccine','healthcare','disease','doctor'],
-    'education': ['school','education','university','college','student','teacher'],
-    'environment': ['climate','environment','emission','carbon','wildfire','hurricane','flood'],
-    'foreign_policy': ['war','ukraine','israel','gaza','foreign','diplomat','sanction','nato','russia','china'],
-    'crime': ['crime','police','murder','assault','theft','court','trial'],
-    'sports': ['match','game','tournament','league','score','player','coach']
+    'economy': [
+        'economy','economic','inflation','deflation','jobs','employment','market','markets','stock','stocks',
+        'gdp','unemployment','wage','wages','salary','salaries','payroll','tax','taxes','budget','deficit','surplus',
+        'interest rate','rates','fed','federal reserve','central bank','bond','bonds','recession','growth'
+    ],
+    'immigration': ['immigration','migrant','migrants','asylum','border','visa','visas','refugee','refugees','deport'],
+    'health': [
+        'health','hospital','covid','vaccine','vaccination','healthcare','disease','doctor','doctors','nurse','medical',
+        'public health','clinic','infection','outbreak','pandemic'
+    ],
+    'education': [
+        'school','schools','education','educational','university','universities','college','student','students','teacher','teachers',
+        'curriculum','classroom','tuition','loan','loans','debt','degree'
+    ],
+    'environment': [
+        'climate','environment','emission','emissions','carbon','wildfire','wildfires','hurricane','flood','drought','heatwave',
+        'greenhouse','pollution','renewable','solar','wind','sustainability'
+    ],
+    'foreign_policy': ['war','ukraine','israel','gaza','foreign','diplomat','diplomacy','sanction','sanctions','nato','russia','china','iran','alliance'],
+    'crime': ['crime','police','murder','assault','theft','burglary','robbery','court','trial','arrest','charges','homicide','violence'],
+    'sports': ['match','game','tournament','league','score','player','players','coach','team','season','final','cup']
 }
 
 def derive_tags(text: str) -> List[str]:
@@ -286,7 +328,7 @@ def run_framing_baseline():
     Y_train = Y_train_all[:, keep_mask]
     Y_val = Y_val_all[:, keep_mask]
     Y_test = Y_test_all[:, keep_mask]
-    vectorizer = TfidfVectorizer(max_features=20000, ngram_range=(1,2))
+    vectorizer = TfidfVectorizer(max_features=30000, ngram_range=(1,3))
     X_train = vectorizer.fit_transform(X_train_txt)
     X_val = vectorizer.transform(X_val_txt)
     X_test = vectorizer.transform(X_test_txt)
@@ -294,15 +336,16 @@ def run_framing_baseline():
     clf.fit(X_train, Y_train)
     # Predict probabilities (preferred) or scores on VAL for threshold tuning
     if hasattr(clf, 'predict_proba'):
-        val_scores = clf.predict_proba(X_val)
+        val_scores_tfidf = clf.predict_proba(X_val)
         is_proba = True
     else:
-        val_scores = clf.decision_function(X_val)
+        val_scores_tfidf = clf.decision_function(X_val)
         is_proba = False
-    # Optional SBERT+TF-IDF ensemble
+    # SBERT embeddings pathway (for embeddings-only or ensemble)
     ensemble = os.getenv('FRAMING_ENSEMBLE', '0') == '1'
-    if ensemble:
-        # SBERT embeddings pathway
+    use_emb = FRAMING_EMBEDDINGS_ONLY or ensemble
+    emb_model = None
+    if use_emb:
         emb_model = SentenceTransformer(EMBEDDER)
         X_train_emb = emb_model.encode(X_train_txt, normalize_embeddings=True)
         X_val_emb = emb_model.encode(X_val_txt, normalize_embeddings=True)
@@ -313,8 +356,13 @@ def run_framing_baseline():
             val_scores_emb = emb_clf.predict_proba(X_val_emb)
         else:
             val_scores_emb = emb_clf.decision_function(X_val_emb)
-        # average scores
-        val_scores = (np.asarray(val_scores) + np.asarray(val_scores_emb)) / 2.0
+    # Choose scores for threshold tuning
+    if FRAMING_EMBEDDINGS_ONLY:
+        val_scores = np.asarray(val_scores_emb)
+    elif ensemble and use_emb:
+        val_scores = (np.asarray(val_scores_tfidf) + np.asarray(val_scores_emb)) / 2.0
+    else:
+        val_scores = np.asarray(val_scores_tfidf)
 
     thresholds = []
     if FRAMING_TUNE_THRESHOLDS:
@@ -334,16 +382,23 @@ def run_framing_baseline():
             thresholds.append(float(GLOBAL_FRAMING_THRESHOLD if is_proba else 0.0))
 
     # Evaluate on TEST with tuned thresholds
+    # Compute test scores for selected variant(s)
     if hasattr(clf, 'predict_proba'):
-        test_scores = clf.predict_proba(X_test)
+        test_scores_tfidf = clf.predict_proba(X_test)
     else:
-        test_scores = clf.decision_function(X_test)
-    if ensemble:
+        test_scores_tfidf = clf.decision_function(X_test)
+    test_scores = np.asarray(test_scores_tfidf)
+    test_scores_emb = None
+    if use_emb:
         if hasattr(emb_clf, 'predict_proba'):
             test_scores_emb = emb_clf.predict_proba(X_test_emb)
         else:
             test_scores_emb = emb_clf.decision_function(X_test_emb)
-        test_scores = (np.asarray(test_scores) + np.asarray(test_scores_emb)) / 2.0
+        test_scores_emb = np.asarray(test_scores_emb)
+    if FRAMING_EMBEDDINGS_ONLY and test_scores_emb is not None:
+        test_scores = test_scores_emb
+    elif ensemble and test_scores_emb is not None:
+        test_scores = (test_scores + test_scores_emb) / 2.0
 
     Y_pred = np.zeros_like(Y_test)
     for j, t in enumerate(thresholds):
@@ -369,6 +424,43 @@ def run_framing_baseline():
     (REPORTS_DIR / 'framing_report.txt').write_text(
         f"Micro-F1={micro_f1:.3f}\nMacro-F1={macro_f1:.3f}\nSubsetAcc={subset_acc:.3f}\nLabels={kept_labels}\nThresholds={thresholds}\nTestSamples={int(Y_test.shape[0])}\nEvaluatedSamples={int(nonempty_mask.sum())}\n"
     )
+    # Write per-variant comparison if available
+    comparisons: Dict[str, Dict[str, float]] = {}
+    # TF-IDF only metrics
+    Y_pred_tfidf = np.zeros_like(Y_test)
+    for j, t in enumerate(thresholds):
+        Y_pred_tfidf[:, j] = (test_scores_tfidf[:, j] >= t).astype(int)
+    Y_pred_tfidf_eval = Y_pred_tfidf[nonempty_mask]
+    comparisons['tfidf'] = {
+        'micro_f1': float(f1_score(Y_test_eval, Y_pred_tfidf_eval, average='micro', zero_division=0)),
+        'macro_f1': float(f1_score(Y_test_eval, Y_pred_tfidf_eval, average='macro', zero_division=0)),
+        'subset_accuracy': float(accuracy_score(Y_test_eval, Y_pred_tfidf_eval))
+    }
+    if test_scores_emb is not None:
+        Y_pred_emb = np.zeros_like(Y_test)
+        for j, t in enumerate(thresholds):
+            Y_pred_emb[:, j] = (test_scores_emb[:, j] >= t).astype(int)
+        Y_pred_emb_eval = Y_pred_emb[nonempty_mask]
+        comparisons['sbert'] = {
+            'micro_f1': float(f1_score(Y_test_eval, Y_pred_emb_eval, average='micro', zero_division=0)),
+            'macro_f1': float(f1_score(Y_test_eval, Y_pred_emb_eval, average='macro', zero_division=0)),
+            'subset_accuracy': float(accuracy_score(Y_test_eval, Y_pred_emb_eval))
+        }
+        if ensemble:
+            comparisons['ensemble'] = {
+                'micro_f1': float(micro_f1),
+                'macro_f1': float(macro_f1),
+                'subset_accuracy': float(subset_acc)
+            }
+    (REPORTS_DIR / 'framing_metrics.json').write_text(json.dumps(comparisons, indent=2))
+    # Support counts report
+    support = {
+        'labels': kept_labels,
+        'train_counts': [int(x) for x in Y_train.sum(axis=0).A1] if hasattr(Y_train, 'A1') else [int(x) for x in Y_train.sum(axis=0)],
+        'val_counts': [int(x) for x in Y_val.sum(axis=0).A1] if hasattr(Y_val, 'A1') else [int(x) for x in Y_val.sum(axis=0)],
+        'test_counts': [int(x) for x in Y_test.sum(axis=0).A1] if hasattr(Y_test, 'A1') else [int(x) for x in Y_test.sum(axis=0)]
+    }
+    (REPORTS_DIR / 'framing_support.json').write_text(json.dumps(support, indent=2))
     # Per-tag classification report
     (REPORTS_DIR / 'framing_classification_report.txt').write_text(
         classification_report(Y_test_eval, Y_pred_eval, target_names=kept_labels, zero_division=0)
@@ -380,10 +472,10 @@ def run_framing_baseline():
         'clf': clf,
         'thresholds': thresholds,
         'labels': kept_labels,
-        'ensemble': ensemble
+        'ensemble': ensemble,
+        'emb_model': EMBEDDER if use_emb else None,
+        'emb_clf': emb_clf if use_emb else None
     }
-    if ensemble:
-        framing_bundle.update({'embedder': EMBEDDER, 'emb_clf': emb_clf})
     dump(framing_bundle, OUT_DIR / 'framing_model.joblib')
     # Update params.json with framing section
     params_path = REPORTS_DIR / 'params.json'
@@ -392,12 +484,13 @@ def run_framing_baseline():
     else:
         params = {'embedder': EMBEDDER, 'seed': 42}
     params['framing'] = {
-        'vectorizer': 'tfidf(1,2)',
+        'vectorizer': 'tfidf(1,3)',
         'base_model': 'one-vs-rest logistic',
         'class_weight': 'balanced',
         'thresholds': thresholds,
         'labels': kept_labels,
         'ensemble': ensemble,
+        'embeddings_only': FRAMING_EMBEDDINGS_ONLY,
         'micro_f1': float(micro_f1),
         'macro_f1': float(macro_f1),
         'subset_accuracy': float(subset_acc)

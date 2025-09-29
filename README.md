@@ -86,26 +86,74 @@ psql "$DATABASE_URL" -f sql/schema.sql
 
 ### 2. Ingest Articles
 ```bash
-python scripts/ingest_rss.py
+# Recommended: run as modules so imports resolve cleanly
+python -m scripts.ingest_rss
 ```
 
 ### 3. Embed & Cluster
 ```bash
-python scripts/embed_titles.py
-python scripts/cluster_events.py
+# Embeddings/cluster intermediates saved to DATA_DIR (default ./data)
+export DATA_DIR=./data
+python -m scripts.embed_titles
+python -m scripts.cluster_events
 ```
 
-### 4. Run Baselines
+### 4. Run Baselines (Stance + Framing)
 ```bash
-python scripts/evaluate_baselines.py
+# Writes artifacts under ./reports/ and persists models to ./outputs/
+python -m scripts.evaluate_baselines
 ```
-(Replace with real datasets for meaningful metrics)
+
+Artifacts written:
+- reports/stance_classification_report.txt
+- reports/stance_confusion_matrix.png
+- reports/stance_reliability_plot.png (when available)
+- reports/framing_report.txt (micro/macro F1, subset accuracy, thresholds)
+- reports/framing_classification_report.txt (per-tag metrics)
+- reports/params.json (embedder, seed, selected models/params)
+
+Persisted models:
+- outputs/stance_model.joblib (model + label encoder)
+- outputs/framing_model.joblib (vectorizer + classifier + thresholds + labels)
 
 ### 5. Run API
 ```bash
 uvicorn api.main:app --reload
 ```
 Frontend will fetch from `localhost:8000`.
+
+---
+
+## ⚙️ Evaluation Options (env vars)
+
+Stance/Framing evaluation accepts the following environment variables:
+
+- EVAL_EMBEDDER: Sentence-Transformers model (default `sentence-transformers/all-MiniLM-L6-v2`).
+- REPORTS_DIR: Directory for reports (default `./reports`).
+- EVAL_DATA_DIR, EVAL_OUT_DIR: Data/output dirs (defaults `./data`, `./outputs`).
+
+Framing-specific:
+- FRAMING_TUNE_THRESHOLDS: `1` to tune per-tag thresholds on validation; `0` to skip and use a global threshold (default `1`).
+- FRAMING_THRESHOLD: Global threshold when tuning is off (default `0.3`).
+- FRAMING_ENSEMBLE: `1` to ensemble TF-IDF + SBERT logistic; `0` to use TF-IDF only (default `0`).
+
+Stance-specific:
+- STANCE_CALIBRATE: `1` to calibrate LinearSVC with sigmoid (enables probabilities); `0` to skip for speed (default `1`).
+
+Examples:
+```bash
+# Fast-mode example
+export STANCE_CALIBRATE=0
+export FRAMING_TUNE_THRESHOLDS=0
+export FRAMING_THRESHOLD=0.2
+python -m scripts.evaluate_baselines
+
+# Thorough-mode example
+export EVAL_EMBEDDER=sentence-transformers/all-mpnet-base-v2
+export FRAMING_TUNE_THRESHOLDS=1
+export FRAMING_ENSEMBLE=1
+python -m scripts.evaluate_baselines
+```
 
 ---
 

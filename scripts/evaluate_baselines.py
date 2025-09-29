@@ -218,22 +218,37 @@ def run_framing_baseline():
     if not texts:
         print('No articles available for framing baseline.')
         return
+    # Keep only weakly-labeled samples to avoid degenerate training
+    supervised = [(t, tags) for t, tags in zip(texts, tag_lists) if len(tags) > 0]
+    if not supervised:
+        print('No weakly-labeled examples derived from keywords; expand KEYWORD_TAGS.')
+        return
+    texts_sup, tags_sup = zip(*supervised)
     mlb = MultiLabelBinarizer(classes=sorted(KEYWORD_TAGS.keys()))
-    Y = mlb.fit_transform(tag_lists)
-    X_train_txt, X_test_txt, Y_train, Y_test = train_test_split(texts, Y, test_size=0.2, random_state=42)
+    Y = mlb.fit_transform(tags_sup)
+    X_train_txt, X_test_txt, Y_train, Y_test = train_test_split(texts_sup, Y, test_size=0.2, random_state=42)
     vectorizer = TfidfVectorizer(max_features=20000, ngram_range=(1,2))
     X_train = vectorizer.fit_transform(X_train_txt)
     X_test = vectorizer.transform(X_test_txt)
-    clf = OneVsRestClassifier(LogisticRegression(max_iter=1000, n_jobs=None))
+    clf = OneVsRestClassifier(LogisticRegression(max_iter=1000, n_jobs=None, class_weight='balanced'))
     clf.fit(X_train, Y_train)
-    Y_pred = clf.predict(X_test)
+    # Threshold scores to avoid always-zero predictions; ensure at least 1 tag per sample
+    if hasattr(clf, 'decision_function'):
+        scores = clf.decision_function(X_test)
+    else:
+        scores = clf.predict_proba(X_test)
+    threshold = float(os.getenv('FRAMING_THRESHOLD', '0.3'))
+    Y_pred = (scores >= threshold).astype(int)
+    for i in range(Y_pred.shape[0]):
+        if Y_pred[i].sum() == 0:
+            Y_pred[i, int(np.argmax(scores[i]))] = 1
     micro_f1 = f1_score(Y_test, Y_pred, average='micro', zero_division=0)
     subset_acc = accuracy_score(Y_test, Y_pred)
     print('Framing Micro-F1:', micro_f1)
     print('Framing Subset Accuracy:', subset_acc)
     # Save basic report
     (OUT_DIR / 'framing').mkdir(parents=True, exist_ok=True)
-    (OUT_DIR / 'framing' / 'metrics.json').write_text(json.dumps({'micro_f1': micro_f1, 'subset_accuracy': subset_acc}, indent=2))
+    (OUT_DIR / 'framing' / 'metrics.json').write_text(json.dumps({'micro_f1': micro_f1, 'subset_accuracy': subset_acc, 'threshold': threshold}, indent=2))
 
 if __name__ == '__main__':
     run_stance_baseline()

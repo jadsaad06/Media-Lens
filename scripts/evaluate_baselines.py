@@ -43,6 +43,10 @@ STANCE_CALIBRATE = os.getenv('STANCE_CALIBRATE', '1') == '1'
 FRAMING_TUNE_THRESHOLDS = os.getenv('FRAMING_TUNE_THRESHOLDS', '1') == '1'
 GLOBAL_FRAMING_THRESHOLD = float(os.getenv('FRAMING_THRESHOLD', '0.3'))
 FRAMING_EMBEDDINGS_ONLY = os.getenv('FRAMING_EMBEDDINGS_ONLY', '0') == '1'
+FRAMING_TOPK = int(os.getenv('FRAMING_TOPK', '0'))  # 0 disables, >0 enforces top-k
+_ng = os.getenv('FRAMING_TFIDF_NGRAMS', '1,2').split(',')
+FRAMING_TFIDF_NGRAMS = (int(_ng[0]), int(_ng[1]) if len(_ng) > 1 else int(_ng[0]))
+FRAMING_TFIDF_MAX_FEATURES = int(os.getenv('FRAMING_TFIDF_MAX_FEATURES', '20000'))
 
 # ----------------------
 # FNC-1 Stance Loading
@@ -328,7 +332,7 @@ def run_framing_baseline():
     Y_train = Y_train_all[:, keep_mask]
     Y_val = Y_val_all[:, keep_mask]
     Y_test = Y_test_all[:, keep_mask]
-    vectorizer = TfidfVectorizer(max_features=30000, ngram_range=(1,3))
+    vectorizer = TfidfVectorizer(max_features=FRAMING_TFIDF_MAX_FEATURES, ngram_range=FRAMING_TFIDF_NGRAMS)
     X_train = vectorizer.fit_transform(X_train_txt)
     X_val = vectorizer.transform(X_val_txt)
     X_test = vectorizer.transform(X_test_txt)
@@ -403,10 +407,15 @@ def run_framing_baseline():
     Y_pred = np.zeros_like(Y_test)
     for j, t in enumerate(thresholds):
         Y_pred[:, j] = (test_scores[:, j] >= t).astype(int)
-    # Fallback: ensure at least one tag per sample
+    # Fallbacks
     for i in range(Y_pred.shape[0]):
         if Y_pred[i].sum() == 0:
             Y_pred[i, int(np.argmax(test_scores[i]))] = 1
+        # Optional: enforce top-k predictions to improve subset accuracy
+        if FRAMING_TOPK > 0:
+            topk_idx = np.argsort(test_scores[i])[-FRAMING_TOPK:]
+            Y_pred[i, :] = 0
+            Y_pred[i, topk_idx] = 1
     # Evaluate only on samples that still have at least one true label after label filtering
     nonempty_mask = (Y_test.sum(axis=1) > 0).A1 if hasattr(Y_test, 'A1') else (Y_test.sum(axis=1) > 0)
     if nonempty_mask.sum() == 0:
@@ -484,13 +493,15 @@ def run_framing_baseline():
     else:
         params = {'embedder': EMBEDDER, 'seed': 42}
     params['framing'] = {
-        'vectorizer': 'tfidf(1,3)',
+        'vectorizer': f"tfidf{FRAMING_TFIDF_NGRAMS}",
         'base_model': 'one-vs-rest logistic',
         'class_weight': 'balanced',
         'thresholds': thresholds,
         'labels': kept_labels,
         'ensemble': ensemble,
         'embeddings_only': FRAMING_EMBEDDINGS_ONLY,
+        'topk': FRAMING_TOPK,
+        'tfidf_max_features': FRAMING_TFIDF_MAX_FEATURES,
         'micro_f1': float(micro_f1),
         'macro_f1': float(macro_f1),
         'subset_accuracy': float(subset_acc)

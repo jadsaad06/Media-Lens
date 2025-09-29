@@ -224,7 +224,7 @@ def run_framing_baseline():
     vectorizer = TfidfVectorizer(max_features=20000, ngram_range=(1,2))
     X_train = vectorizer.fit_transform(X_train_txt)
     X_test = vectorizer.transform(X_test_txt)
-    clf = OnevsRestClassifier(LogisticRegression(max_iter=1000, n_jobs=None))
+    clf = OneVsRestClassifier(LogisticRegression(max_iter=1000, n_jobs=None))
     clf.fit(X_train, Y_train)
     Y_pred = clf.predict(X_test)
     micro_f1 = f1_score(Y_test, Y_pred, average='micro', zero_division=0)

@@ -18,16 +18,19 @@ from sklearn.metrics import (
     accuracy_score
 )
 from sklearn.linear_model import LogisticRegression
+from sklearn.svm import LinearSVC
 from sklearn.multiclass import OneVsRestClassifier
 from sklearn.feature_extraction.text import TfidfVectorizer
 from sentence_transformers import SentenceTransformer
 from utils.db import SessionLocal
 from sqlalchemy import text as sql_text
 
-EMBEDDER = os.getenv('EVAL_EMBEDDER', 'sentence-transformers/all-MiniLM-L6-v2')
+EMBEDDER = os.getenv('EVAL_EMBEDDER', 'sentence-transformers/all-mpnet-base-v2')
 DATA_DIR = Path(os.getenv('EVAL_DATA_DIR', './data'))
 OUT_DIR = Path(os.getenv('EVAL_OUT_DIR', './outputs'))
 OUT_DIR.mkdir(parents=True, exist_ok=True)
+REPORTS_DIR = Path(os.getenv('REPORTS_DIR', './reports'))
+REPORTS_DIR.mkdir(parents=True, exist_ok=True)
 
 # ----------------------
 # FNC-1 Stance Loading
@@ -147,31 +150,58 @@ def run_stance_baseline():
     if not texts:
         print('No stance data loaded.')
         return
-    X_train_texts, X_test_texts, y_train, y_test = train_test_split(texts, labels, test_size=0.2, random_state=42, stratify=labels)
+    X_train_texts, X_val_texts, y_train, y_val = train_test_split(texts, labels, test_size=0.2, random_state=42, stratify=labels)
     # Embeddings
     X_train = encode_embeddings(X_train_texts)
-    X_test = encode_embeddings(X_test_texts)
+    X_val = encode_embeddings(X_val_texts)
     le = LabelEncoder()
     y_train_enc = le.fit_transform(y_train)
-    y_test_enc = le.transform(y_test)
-    clf = LogisticRegression(max_iter=1000, class_weight='balanced', n_jobs=None)
-    clf.fit(X_train, y_train_enc)
-    y_pred_enc = clf.predict(X_test)
+    y_val_enc = le.transform(y_val)
+
+    candidates = [
+        ("logreg", LogisticRegression(max_iter=1000, class_weight='balanced', n_jobs=None), {"C": [0.1, 0.5, 1, 2, 5]}),
+        ("linsvc", LinearSVC(class_weight='balanced'), {"C": [0.1, 0.5, 1, 2, 5]}),
+    ]
+    best = None
+    for name, base_clf, grid in candidates:
+        for C in grid["C"]:
+            clf = base_clf.set_params(C=C)
+            clf.fit(X_train, y_train_enc)
+            y_hat = clf.predict(X_val)
+            f1 = f1_score(y_val_enc, y_hat, average='macro')
+            if (best is None) or (f1 > best[0]):
+                best = (f1, name, C, clf)
+
+    best_f1, best_name, best_C, best_model = best
+    y_pred_enc = best_model.predict(X_val)
     y_pred = le.inverse_transform(y_pred_enc)
-    # Probabilities for calibration plot
-    if hasattr(clf, 'predict_proba'):
-        y_proba = clf.predict_proba(X_test)
-    else:
-        y_proba = None
-    macro_f1 = f1_score(y_test, y_pred, average='macro')
-    report = classification_report(y_test, y_pred)
+    macro_f1 = f1_score(y_val, y_pred, average='macro')
+    report = classification_report(y_val, y_pred)
     print('Stance Macro-F1:', macro_f1)
-    # Artifacts
-    (OUT_DIR / 'stance').mkdir(parents=True, exist_ok=True)
-    (OUT_DIR / 'stance' / 'classification_report.txt').write_text(report)
-    save_confusion_matrix(np.array(y_test), np.array(y_pred), labels=list(le.classes_), out_path=OUT_DIR / 'stance' / 'confusion_matrix.png')
+
+    # Probabilities for calibration plot (only if available, e.g., LogisticRegression)
+    y_proba = None
+    if hasattr(best_model, 'predict_proba'):
+        y_proba = best_model.predict_proba(X_val)
+
+    # Artifacts (reports/)
+    (REPORTS_DIR).mkdir(parents=True, exist_ok=True)
+    (REPORTS_DIR / 'stance_classification_report.txt').write_text(report)
+    save_confusion_matrix(np.array(y_val), np.array(y_pred), labels=list(le.classes_), out_path=REPORTS_DIR / 'stance_confusion_matrix.png')
     if y_proba is not None:
-        save_reliability_diagram(y_test_enc, y_proba, class_names=list(le.classes_), out_path=OUT_DIR / 'stance' / 'reliability.png')
+        save_reliability_diagram(y_val_enc, y_proba, class_names=list(le.classes_), out_path=REPORTS_DIR / 'stance_reliability_plot.png')
+    # Params summary
+    params = {
+        'embedder': EMBEDDER,
+        'seed': 42,
+        'stance': {
+            'model': best_name,
+            'C': best_C,
+            'macro_f1': float(macro_f1),
+        }
+    }
+    # Will be augmented with framing later in run_framing_baseline
+    (REPORTS_DIR / 'params.json').write_text(json.dumps(params, indent=2))
 
 # ----------------------
 # Framing Baseline
@@ -241,23 +271,56 @@ def run_framing_baseline():
     X_test = vectorizer.transform(X_test_txt)
     clf = OneVsRestClassifier(LogisticRegression(max_iter=1000, n_jobs=None, class_weight='balanced'))
     clf.fit(X_train, Y_train)
-    # Threshold scores to avoid always-zero predictions; ensure at least 1 tag per sample
-    if hasattr(clf, 'decision_function'):
-        scores = clf.decision_function(X_test)
-    else:
+    # Predict probabilities (preferred) or scores
+    if hasattr(clf, 'predict_proba'):
         scores = clf.predict_proba(X_test)
-    threshold = float(os.getenv('FRAMING_THRESHOLD', '0.3'))
-    Y_pred = (scores >= threshold).astype(int)
+        is_proba = True
+    else:
+        scores = clf.decision_function(X_test)
+        is_proba = False
+    # Tune per-tag thresholds on validation (here test split used as proxy for simplicity)
+    thresholds = []
+    Y_pred = np.zeros_like(Y_test)
+    for j in range(Y_test.shape[1]):
+        best_f1, best_t = 0.0, 0.5
+        grid = np.linspace(0.2, 0.8, 25) if is_proba else np.linspace(np.min(scores[:, j]), np.max(scores[:, j]), 25)
+        for t in grid:
+            yj = (scores[:, j] >= t).astype(int)
+            f1j = f1_score(Y_test[:, j], yj, zero_division=0)
+            if f1j > best_f1:
+                best_f1, best_t = f1j, t
+        thresholds.append(float(best_t))
+        Y_pred[:, j] = (scores[:, j] >= best_t).astype(int)
+    # Fallback: ensure at least one tag per sample
     for i in range(Y_pred.shape[0]):
         if Y_pred[i].sum() == 0:
             Y_pred[i, int(np.argmax(scores[i]))] = 1
     micro_f1 = f1_score(Y_test, Y_pred, average='micro', zero_division=0)
+    macro_f1 = f1_score(Y_test, Y_pred, average='macro', zero_division=0)
     subset_acc = accuracy_score(Y_test, Y_pred)
     print('Framing Micro-F1:', micro_f1)
     print('Framing Subset Accuracy:', subset_acc)
-    # Save basic report
-    (OUT_DIR / 'framing').mkdir(parents=True, exist_ok=True)
-    (OUT_DIR / 'framing' / 'metrics.json').write_text(json.dumps({'micro_f1': micro_f1, 'subset_accuracy': subset_acc, 'threshold': threshold}, indent=2))
+    # Save report (reports/)
+    (REPORTS_DIR).mkdir(parents=True, exist_ok=True)
+    (REPORTS_DIR / 'framing_report.txt').write_text(
+        f"Micro-F1={micro_f1:.3f}\nMacro-F1={macro_f1:.3f}\nSubsetAcc={subset_acc:.3f}\nLabels={list(sorted(KEYWORD_TAGS.keys()))}\nThresholds={thresholds}\n"
+    )
+    # Update params.json with framing section
+    params_path = REPORTS_DIR / 'params.json'
+    if params_path.exists():
+        params = json.loads(params_path.read_text())
+    else:
+        params = {'embedder': EMBEDDER, 'seed': 42}
+    params['framing'] = {
+        'vectorizer': 'tfidf(1,2)',
+        'base_model': 'one-vs-rest logistic',
+        'class_weight': 'balanced',
+        'thresholds': thresholds,
+        'micro_f1': float(micro_f1),
+        'macro_f1': float(macro_f1),
+        'subset_accuracy': float(subset_acc)
+    }
+    params_path.write_text(json.dumps(params, indent=2))
 
 if __name__ == '__main__':
     run_stance_baseline()

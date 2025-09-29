@@ -344,19 +344,26 @@ def run_framing_baseline():
     for i in range(Y_pred.shape[0]):
         if Y_pred[i].sum() == 0:
             Y_pred[i, int(np.argmax(test_scores[i]))] = 1
-    micro_f1 = f1_score(Y_test, Y_pred, average='micro', zero_division=0)
-    macro_f1 = f1_score(Y_test, Y_pred, average='macro', zero_division=0)
-    subset_acc = accuracy_score(Y_test, Y_pred)
+    # Evaluate only on samples that still have at least one true label after label filtering
+    nonempty_mask = (Y_test.sum(axis=1) > 0).A1 if hasattr(Y_test, 'A1') else (Y_test.sum(axis=1) > 0)
+    if nonempty_mask.sum() == 0:
+        print('No non-empty ground-truth samples in test after label filtering; cannot compute framing metrics.')
+        return
+    Y_test_eval = Y_test[nonempty_mask]
+    Y_pred_eval = Y_pred[nonempty_mask]
+    micro_f1 = f1_score(Y_test_eval, Y_pred_eval, average='micro', zero_division=0)
+    macro_f1 = f1_score(Y_test_eval, Y_pred_eval, average='macro', zero_division=0)
+    subset_acc = accuracy_score(Y_test_eval, Y_pred_eval)
     print('Framing Micro-F1:', micro_f1)
     print('Framing Subset Accuracy:', subset_acc)
     # Save report (reports/)
     (REPORTS_DIR).mkdir(parents=True, exist_ok=True)
     (REPORTS_DIR / 'framing_report.txt').write_text(
-        f"Micro-F1={micro_f1:.3f}\nMacro-F1={macro_f1:.3f}\nSubsetAcc={subset_acc:.3f}\nLabels={kept_labels}\nThresholds={thresholds}\n"
+        f"Micro-F1={micro_f1:.3f}\nMacro-F1={macro_f1:.3f}\nSubsetAcc={subset_acc:.3f}\nLabels={kept_labels}\nThresholds={thresholds}\nTestSamples={int(Y_test.shape[0])}\nEvaluatedSamples={int(nonempty_mask.sum())}\n"
     )
     # Per-tag classification report
     (REPORTS_DIR / 'framing_classification_report.txt').write_text(
-        classification_report(Y_test, Y_pred, target_names=kept_labels)
+        classification_report(Y_test_eval, Y_pred_eval, target_names=kept_labels, zero_division=0)
     )
     # Persist framing model and vectorizer
     OUT_DIR.mkdir(parents=True, exist_ok=True)

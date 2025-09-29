@@ -27,12 +27,15 @@ from sqlalchemy import text as sql_text
 from joblib import dump, load
 from sklearn.calibration import CalibratedClassifierCV
 
-EMBEDDER = os.getenv('EVAL_EMBEDDER', 'sentence-transformers/all-mpnet-base-v2')
+EMBEDDER = os.getenv('EVAL_EMBEDDER', 'sentence-transformers/all-MiniLM-L6-v2')
 DATA_DIR = Path(os.getenv('EVAL_DATA_DIR', './data'))
 OUT_DIR = Path(os.getenv('EVAL_OUT_DIR', './outputs'))
 OUT_DIR.mkdir(parents=True, exist_ok=True)
 REPORTS_DIR = Path(os.getenv('REPORTS_DIR', './reports'))
 REPORTS_DIR.mkdir(parents=True, exist_ok=True)
+STANCE_CALIBRATE = os.getenv('STANCE_CALIBRATE', '1') == '1'
+FRAMING_TUNE_THRESHOLDS = os.getenv('FRAMING_TUNE_THRESHOLDS', '1') == '1'
+GLOBAL_FRAMING_THRESHOLD = float(os.getenv('FRAMING_THRESHOLD', '0.3'))
 
 # ----------------------
 # FNC-1 Stance Loading
@@ -176,7 +179,7 @@ def run_stance_baseline():
 
     best_f1, best_name, best_C, best_model = best
     # Calibrate if needed to obtain probabilities (useful for reliability, abstention, etc.)
-    if best_name == 'linsvc':
+    if best_name == 'linsvc' and STANCE_CALIBRATE:
         svc = LinearSVC(class_weight='balanced', C=best_C)
         cal = CalibratedClassifierCV(svc, method='sigmoid', cv=3)
         cal.fit(X_train, y_train_enc)
@@ -313,17 +316,22 @@ def run_framing_baseline():
         # average scores
         val_scores = (np.asarray(val_scores) + np.asarray(val_scores_emb)) / 2.0
 
-    # Tune per-tag thresholds on VAL
     thresholds = []
-    for j in range(Y_val.shape[1]):
-        best_f1, best_t = 0.0, 0.5
-        grid = np.linspace(0.2, 0.8, 25) if is_proba else np.linspace(np.min(val_scores[:, j]), np.max(val_scores[:, j]), 25)
-        for t in grid:
-            yj = (val_scores[:, j] >= t).astype(int)
-            f1j = f1_score(Y_val[:, j], yj, zero_division=0)
-            if f1j > best_f1:
-                best_f1, best_t = f1j, t
-        thresholds.append(float(best_t))
+    if FRAMING_TUNE_THRESHOLDS:
+        # Tune per-tag thresholds on VAL
+        for j in range(Y_val.shape[1]):
+            best_f1, best_t = 0.0, 0.5
+            grid = np.linspace(0.2, 0.8, 25) if is_proba else np.linspace(np.min(val_scores[:, j]), np.max(val_scores[:, j]), 25)
+            for t in grid:
+                yj = (val_scores[:, j] >= t).astype(int)
+                f1j = f1_score(Y_val[:, j], yj, zero_division=0)
+                if f1j > best_f1:
+                    best_f1, best_t = f1j, t
+            thresholds.append(float(best_t))
+    else:
+        # Use a single global threshold (fast path, approximates earlier behavior)
+        for _ in range(Y_val.shape[1]):
+            thresholds.append(float(GLOBAL_FRAMING_THRESHOLD if is_proba else 0.0))
 
     # Evaluate on TEST with tuned thresholds
     if hasattr(clf, 'predict_proba'):

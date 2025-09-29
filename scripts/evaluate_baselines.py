@@ -154,7 +154,7 @@ def run_stance_baseline():
     le = LabelEncoder()
     y_train_enc = le.fit_transform(y_train)
     y_test_enc = le.transform(y_test)
-    clf = LogisticRegression(max_iter=1000, class_weight='balanced', n_jobs=None, multi_class='auto')
+    clf = LogisticRegression(max_iter=1000, class_weight='balanced', n_jobs=None)
     clf.fit(X_train, y_train_enc)
     y_pred_enc = clf.predict(X_test)
     y_pred = le.inverse_transform(y_pred_enc)
@@ -227,6 +227,15 @@ def run_framing_baseline():
     mlb = MultiLabelBinarizer(classes=sorted(KEYWORD_TAGS.keys()))
     Y = mlb.fit_transform(tags_sup)
     X_train_txt, X_test_txt, Y_train, Y_test = train_test_split(texts_sup, Y, test_size=0.2, random_state=42)
+    # Drop constant columns (all 0s or all 1s) in training to avoid degenerate estimators
+    col_sums = Y_train.sum(axis=0)
+    keep_mask = (col_sums > 0) & (col_sums < Y_train.shape[0])
+    if keep_mask.sum() == 0:
+        print('All framing tags are constant; expand KEYWORD_TAGS or data.')
+        return
+    if keep_mask.sum() < Y_train.shape[1]:
+        Y_train = Y_train[:, keep_mask]
+        Y_test = Y_test[:, keep_mask]
     vectorizer = TfidfVectorizer(max_features=20000, ngram_range=(1,2))
     X_train = vectorizer.fit_transform(X_train_txt)
     X_test = vectorizer.transform(X_test_txt)

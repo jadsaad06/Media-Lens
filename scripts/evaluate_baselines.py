@@ -24,6 +24,8 @@ from sklearn.feature_extraction.text import TfidfVectorizer
 from sentence_transformers import SentenceTransformer
 from utils.db import SessionLocal
 from sqlalchemy import text as sql_text
+from joblib import dump, load
+from sklearn.calibration import CalibratedClassifierCV
 
 EMBEDDER = os.getenv('EVAL_EMBEDDER', 'sentence-transformers/all-mpnet-base-v2')
 DATA_DIR = Path(os.getenv('EVAL_DATA_DIR', './data'))
@@ -173,6 +175,12 @@ def run_stance_baseline():
                 best = (f1, name, C, clf)
 
     best_f1, best_name, best_C, best_model = best
+    # Calibrate if needed to obtain probabilities (useful for reliability, abstention, etc.)
+    if best_name == 'linsvc':
+        svc = LinearSVC(class_weight='balanced', C=best_C)
+        cal = CalibratedClassifierCV(svc, method='sigmoid', cv=3)
+        cal.fit(X_train, y_train_enc)
+        best_model = cal
     y_pred_enc = best_model.predict(X_val)
     y_pred = le.inverse_transform(y_pred_enc)
     macro_f1 = f1_score(y_val, y_pred, average='macro')
@@ -190,6 +198,10 @@ def run_stance_baseline():
     save_confusion_matrix(np.array(y_val), np.array(y_pred), labels=list(le.classes_), out_path=REPORTS_DIR / 'stance_confusion_matrix.png')
     if y_proba is not None:
         save_reliability_diagram(y_val_enc, y_proba, class_names=list(le.classes_), out_path=REPORTS_DIR / 'stance_reliability_plot.png')
+    # Persist model for reuse
+    OUT_DIR.mkdir(parents=True, exist_ok=True)
+    dump({'model': best_model, 'label_encoder': le, 'embedder': EMBEDDER}, OUT_DIR / 'stance_model.joblib')
+
     # Params summary
     params = {
         'embedder': EMBEDDER,
@@ -254,47 +266,84 @@ def run_framing_baseline():
         print('No weakly-labeled examples derived from keywords; expand KEYWORD_TAGS.')
         return
     texts_sup, tags_sup = zip(*supervised)
-    mlb = MultiLabelBinarizer(classes=sorted(KEYWORD_TAGS.keys()))
-    Y = mlb.fit_transform(tags_sup)
-    X_train_txt, X_test_txt, Y_train, Y_test = train_test_split(texts_sup, Y, test_size=0.2, random_state=42)
+    all_labels = sorted(KEYWORD_TAGS.keys())
+    mlb = MultiLabelBinarizer(classes=all_labels)
+    Y_all = mlb.fit_transform(tags_sup)
+    # train/val/test split (avoid tuning on test)
+    X_tmp, X_test_txt, Y_tmp, Y_test_all = train_test_split(list(texts_sup), Y_all, test_size=0.2, random_state=42)
+    X_train_txt, X_val_txt, Y_train_all, Y_val_all = train_test_split(X_tmp, Y_tmp, test_size=0.2, random_state=42)
     # Drop constant columns (all 0s or all 1s) in training to avoid degenerate estimators
-    col_sums = Y_train.sum(axis=0)
-    keep_mask = (col_sums > 0) & (col_sums < Y_train.shape[0])
+    col_sums = Y_train_all.sum(axis=0)
+    keep_mask = (col_sums > 0) & (col_sums < Y_train_all.shape[0])
     if keep_mask.sum() == 0:
         print('All framing tags are constant; expand KEYWORD_TAGS or data.')
         return
-    if keep_mask.sum() < Y_train.shape[1]:
-        Y_train = Y_train[:, keep_mask]
-        Y_test = Y_test[:, keep_mask]
+    keep_idx = np.where(keep_mask)[0]
+    kept_labels = [all_labels[i] for i in keep_idx]
+    Y_train = Y_train_all[:, keep_mask]
+    Y_val = Y_val_all[:, keep_mask]
+    Y_test = Y_test_all[:, keep_mask]
     vectorizer = TfidfVectorizer(max_features=20000, ngram_range=(1,2))
     X_train = vectorizer.fit_transform(X_train_txt)
+    X_val = vectorizer.transform(X_val_txt)
     X_test = vectorizer.transform(X_test_txt)
     clf = OneVsRestClassifier(LogisticRegression(max_iter=1000, n_jobs=None, class_weight='balanced'))
     clf.fit(X_train, Y_train)
-    # Predict probabilities (preferred) or scores
+    # Predict probabilities (preferred) or scores on VAL for threshold tuning
     if hasattr(clf, 'predict_proba'):
-        scores = clf.predict_proba(X_test)
+        val_scores = clf.predict_proba(X_val)
         is_proba = True
     else:
-        scores = clf.decision_function(X_test)
+        val_scores = clf.decision_function(X_val)
         is_proba = False
-    # Tune per-tag thresholds on validation (here test split used as proxy for simplicity)
+    # Optional SBERT+TF-IDF ensemble
+    ensemble = os.getenv('FRAMING_ENSEMBLE', '0') == '1'
+    if ensemble:
+        # SBERT embeddings pathway
+        emb_model = SentenceTransformer(EMBEDDER)
+        X_train_emb = emb_model.encode(X_train_txt, normalize_embeddings=True)
+        X_val_emb = emb_model.encode(X_val_txt, normalize_embeddings=True)
+        X_test_emb = emb_model.encode(X_test_txt, normalize_embeddings=True)
+        emb_clf = OneVsRestClassifier(LogisticRegression(max_iter=1000, n_jobs=None, class_weight='balanced'))
+        emb_clf.fit(X_train_emb, Y_train)
+        if hasattr(emb_clf, 'predict_proba'):
+            val_scores_emb = emb_clf.predict_proba(X_val_emb)
+        else:
+            val_scores_emb = emb_clf.decision_function(X_val_emb)
+        # average scores
+        val_scores = (np.asarray(val_scores) + np.asarray(val_scores_emb)) / 2.0
+
+    # Tune per-tag thresholds on VAL
     thresholds = []
-    Y_pred = np.zeros_like(Y_test)
-    for j in range(Y_test.shape[1]):
+    for j in range(Y_val.shape[1]):
         best_f1, best_t = 0.0, 0.5
-        grid = np.linspace(0.2, 0.8, 25) if is_proba else np.linspace(np.min(scores[:, j]), np.max(scores[:, j]), 25)
+        grid = np.linspace(0.2, 0.8, 25) if is_proba else np.linspace(np.min(val_scores[:, j]), np.max(val_scores[:, j]), 25)
         for t in grid:
-            yj = (scores[:, j] >= t).astype(int)
-            f1j = f1_score(Y_test[:, j], yj, zero_division=0)
+            yj = (val_scores[:, j] >= t).astype(int)
+            f1j = f1_score(Y_val[:, j], yj, zero_division=0)
             if f1j > best_f1:
                 best_f1, best_t = f1j, t
         thresholds.append(float(best_t))
-        Y_pred[:, j] = (scores[:, j] >= best_t).astype(int)
+
+    # Evaluate on TEST with tuned thresholds
+    if hasattr(clf, 'predict_proba'):
+        test_scores = clf.predict_proba(X_test)
+    else:
+        test_scores = clf.decision_function(X_test)
+    if ensemble:
+        if hasattr(emb_clf, 'predict_proba'):
+            test_scores_emb = emb_clf.predict_proba(X_test_emb)
+        else:
+            test_scores_emb = emb_clf.decision_function(X_test_emb)
+        test_scores = (np.asarray(test_scores) + np.asarray(test_scores_emb)) / 2.0
+
+    Y_pred = np.zeros_like(Y_test)
+    for j, t in enumerate(thresholds):
+        Y_pred[:, j] = (test_scores[:, j] >= t).astype(int)
     # Fallback: ensure at least one tag per sample
     for i in range(Y_pred.shape[0]):
         if Y_pred[i].sum() == 0:
-            Y_pred[i, int(np.argmax(scores[i]))] = 1
+            Y_pred[i, int(np.argmax(test_scores[i]))] = 1
     micro_f1 = f1_score(Y_test, Y_pred, average='micro', zero_division=0)
     macro_f1 = f1_score(Y_test, Y_pred, average='macro', zero_division=0)
     subset_acc = accuracy_score(Y_test, Y_pred)
@@ -303,8 +352,24 @@ def run_framing_baseline():
     # Save report (reports/)
     (REPORTS_DIR).mkdir(parents=True, exist_ok=True)
     (REPORTS_DIR / 'framing_report.txt').write_text(
-        f"Micro-F1={micro_f1:.3f}\nMacro-F1={macro_f1:.3f}\nSubsetAcc={subset_acc:.3f}\nLabels={list(sorted(KEYWORD_TAGS.keys()))}\nThresholds={thresholds}\n"
+        f"Micro-F1={micro_f1:.3f}\nMacro-F1={macro_f1:.3f}\nSubsetAcc={subset_acc:.3f}\nLabels={kept_labels}\nThresholds={thresholds}\n"
     )
+    # Per-tag classification report
+    (REPORTS_DIR / 'framing_classification_report.txt').write_text(
+        classification_report(Y_test, Y_pred, target_names=kept_labels)
+    )
+    # Persist framing model and vectorizer
+    OUT_DIR.mkdir(parents=True, exist_ok=True)
+    framing_bundle = {
+        'vectorizer': vectorizer,
+        'clf': clf,
+        'thresholds': thresholds,
+        'labels': kept_labels,
+        'ensemble': ensemble
+    }
+    if ensemble:
+        framing_bundle.update({'embedder': EMBEDDER, 'emb_clf': emb_clf})
+    dump(framing_bundle, OUT_DIR / 'framing_model.joblib')
     # Update params.json with framing section
     params_path = REPORTS_DIR / 'params.json'
     if params_path.exists():
@@ -316,6 +381,8 @@ def run_framing_baseline():
         'base_model': 'one-vs-rest logistic',
         'class_weight': 'balanced',
         'thresholds': thresholds,
+        'labels': kept_labels,
+        'ensemble': ensemble,
         'micro_f1': float(micro_f1),
         'macro_f1': float(macro_f1),
         'subset_accuracy': float(subset_acc)
